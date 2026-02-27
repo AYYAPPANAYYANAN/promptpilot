@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+groq
+supabase
+elevenlabs
+diffusers
+torch
+transformers
+accelerate
