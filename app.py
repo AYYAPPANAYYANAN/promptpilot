@@ -1,51 +1,21 @@
-"""
-PromptPilot Enterprise v7
-Production-oriented AI prompt engineering platform.
 
-Layers
-------
-1. API / transport
-2. Security + request context
-3. Validation
-4. Intent & prompt planning
-5. Quality / confidence / deterministic fallback
-6. AI execution
-7. Optional voice
-8. Persistence / telemetry
-9. Health / observability
+import os, re, json, time, uuid, hashlib
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-Design goal:
-Fast default path, deterministic structured planning, graceful degradation,
-and clean separation between prompt optimization and response execution.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import base64
-import json
-import logging
-import os
-import re
-import time
-import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, Optional
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from groq import Groq
+import streamlit as st
 
 try:
-    from supabase import Client, create_client
+    from groq import Groq
 except Exception:
-    Client = Any
+    Groq = None
+
+try:
+    from supabase import create_client, Client
+except Exception:
     create_client = None
+    Client = Any
 
 try:
     from elevenlabs.client import ElevenLabs
@@ -53,1126 +23,690 @@ except Exception:
     ElevenLabs = None
 
 
-# ============================================================================
-# 1. CONFIGURATION LAYER
-# ============================================================================
+# ============================================================
+# PromptPilot Enterprise — Streamlit-native reference app
+# Layers:
+# UI -> Application -> Orchestration -> Intelligence -> Providers
+# -> Persistence/Telemetry
+# ============================================================
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
-
-    app_name: str = "PromptPilot Enterprise"
-    version: str = "7.0.0"
-    environment: str = "development"
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    groq_api_key: str = ""
-    groq_fast_model: str = "openai/gpt-oss-20b"
-    groq_quality_model: str = "openai/gpt-oss-120b"
-
-    supabase_url: str = ""
-    supabase_key: str = ""
-
-    elevenlabs_api_key: str = ""
-    elevenlabs_voice_id: str = ""
-
-    max_input_chars: int = 12000
-    request_timeout_seconds: float = 45.0
-    max_completion_tokens_fast: int = 1800
-    max_completion_tokens_quality: int = 3200
-
-    enable_telemetry: bool = True
-    allowed_origins: str = "*"
-
-
-settings = Settings()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+st.set_page_config(
+    page_title="PromptPilot Enterprise",
+    page_icon="✦",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-logger = logging.getLogger("promptpilot")
+# ----------------------------- Design System -----------------------------
 
-
-# ============================================================================
-# 2. CLIENT / RESOURCE LAYER
-# ============================================================================
-
-groq_client: Optional[Groq] = None
-supabase: Optional[Client] = None
-elevenlabs_client = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global groq_client, supabase, elevenlabs_client
-
-    if settings.groq_api_key:
-        groq_client = Groq(api_key=settings.groq_api_key)
-        logger.info("Groq client initialized.")
-    else:
-        logger.warning("GROQ_API_KEY is missing.")
-
-    if (
-        settings.supabase_url
-        and settings.supabase_key
-        and create_client
-    ):
-        try:
-            supabase = create_client(
-                settings.supabase_url,
-                settings.supabase_key,
-            )
-            logger.info("Supabase client initialized.")
-        except Exception:
-            logger.exception("Supabase initialization failed.")
-
-    if (
-        settings.elevenlabs_api_key
-        and settings.elevenlabs_voice_id
-        and ElevenLabs
-    ):
-        try:
-            elevenlabs_client = ElevenLabs(
-                api_key=settings.elevenlabs_api_key
-            )
-            logger.info("ElevenLabs client initialized.")
-        except Exception:
-            logger.exception("ElevenLabs initialization failed.")
-
-    yield
-
-    groq_client = None
-    supabase = None
-    elevenlabs_client = None
-
-
-# ============================================================================
-# 3. APPLICATION LAYER
-# ============================================================================
-
-app = FastAPI(
-    title=settings.app_name,
-    version=settings.version,
-    description="Enterprise prompt engineering and AI execution platform.",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    lifespan=lifespan,
-)
-
-
-origins = [
-    x.strip()
-    for x in settings.allowed_origins.split(",")
-    if x.strip()
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins if origins != ["*"] else ["*"],
-    allow_credentials=origins != ["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================================
-# 4. REQUEST CONTEXT / SECURITY LAYER
-# ============================================================================
-
-@app.middleware("http")
-async def request_context(
-    request: Request,
-    call_next,
-):
-    request_id = (
-        request.headers.get("x-request-id")
-        or str(uuid.uuid4())
-    )
-
-    started = time.perf_counter()
-
-    try:
-        response = await call_next(request)
-
-    except Exception:
-        logger.exception(
-            "Unhandled exception | request_id=%s",
-            request_id,
-        )
-
-        response = JSONResponse(
-            status_code=500,
-            content={
-                "error": {
-                    "code": "internal_error",
-                    "message": "Internal server error.",
-                },
-                "request_id": request_id,
-            },
-        )
-
-    elapsed_ms = (
-        time.perf_counter() - started
-    ) * 1000
-
-    response.headers["x-request-id"] = request_id
-    response.headers["x-response-time-ms"] = str(
-        round(elapsed_ms, 2)
-    )
-
-    # Basic hardening.
-    response.headers["x-content-type-options"] = "nosniff"
-    response.headers["x-frame-options"] = "DENY"
-    response.headers["referrer-policy"] = (
-        "strict-origin-when-cross-origin"
-    )
-    response.headers["permissions-policy"] = (
-        "camera=(), geolocation=(), payment=()"
-    )
-
-    logger.info(
-        "%s %s -> %s | %.1f ms | %s",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed_ms,
-        request_id,
-    )
-
-    return response
-
-
-# ============================================================================
-# 5. DOMAIN SCHEMAS
-# ============================================================================
-
-class UserProfile(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    name: str = "User"
-    role: str = "Professional"
-    domain: str = ""
-    expertise: str = ""
-    tone: str = "clear"
-    language: str = "English"
-
-
-class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    user_input: str = Field(
-        min_length=1,
-        max_length=12000,
-    )
-
-    user_profile: UserProfile = Field(
-        default_factory=UserProfile
-    )
-
-    quality: str = Field(
-        default="fast",
-        pattern="^(fast|quality)$",
-    )
-
-    include_execution: bool = True
-    use_voice: bool = False
-
-    @field_validator("user_input")
-    @classmethod
-    def normalize_input(cls, value: str) -> str:
-        value = value.strip()
-
-        # Collapse pathological whitespace without destroying
-        # useful newlines.
-        value = re.sub(
-            r"[ \t]{3,}",
-            "  ",
-            value,
-        )
-
-        if not value:
-            raise ValueError(
-                "user_input cannot be empty."
-            )
-
-        return value
-
-
-class PromptPlan(BaseModel):
-    intent: str
-    task: str
-    context: str
-    constraints: list[str]
-    output_format: str
-    assumptions: list[str]
-    optimized_prompt: str
-    confidence: float = Field(
-        ge=0.0,
-        le=1.0,
-    )
-
-
-# ============================================================================
-# 6. PROMPT INTELLIGENCE LAYER
-# ============================================================================
-
-PROMPT_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "intent": {
-            "type": "string"
-        },
-        "task": {
-            "type": "string"
-        },
-        "context": {
-            "type": "string"
-        },
-        "constraints": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "output_format": {
-            "type": "string"
-        },
-        "assumptions": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "optimized_prompt": {
-            "type": "string"
-        },
-        "confidence": {
-            "type": "number"
-        },
-    },
-    "required": [
-        "intent",
-        "task",
-        "context",
-        "constraints",
-        "output_format",
-        "assumptions",
-        "optimized_prompt",
-        "confidence",
-    ],
-    "additionalProperties": False,
+CSS = """
+<style>
+:root {
+  --pp-blue: #1457ff;
+  --pp-blue-2: #0b3dcc;
+  --pp-blue-50: #eff5ff;
+  --pp-blue-100: #dce8ff;
+  --pp-green: #0b8f63;
+  --pp-green-50: #ecfbf5;
+  --pp-ink: #10213f;
+  --pp-muted: #63728b;
+  --pp-line: #dce4f0;
+  --pp-bg: #f5f8fc;
+  --pp-white: #ffffff;
+  --pp-danger: #c83232;
+  --pp-radius: 18px;
 }
+.stApp { background: var(--pp-bg); color: var(--pp-ink); }
+.block-container { max-width: 1480px; padding-top: 1.25rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid var(--pp-line); }
+[data-testid="stSidebar"] > div:first-child { padding-top: 1.25rem; }
+h1,h2,h3,h4 { color: var(--pp-ink) !important; letter-spacing: -0.02em; }
+p, label, .stCaption { color: var(--pp-muted); }
+.stButton > button {
+  border-radius: 11px !important;
+  border: 1px solid var(--pp-line) !important;
+  min-height: 42px;
+  font-weight: 700;
+}
+.stButton > button[kind="primary"] {
+  background: var(--pp-blue) !important;
+  border-color: var(--pp-blue) !important;
+  color: white !important;
+}
+.stTextArea textarea, .stTextInput input, .stSelectbox div[data-baseweb="select"] {
+  border-radius: 12px !important;
+  border-color: var(--pp-line) !important;
+}
+.pp-topbar {
+  background: white; border: 1px solid var(--pp-line); border-radius: 16px;
+  padding: 13px 18px; display:flex; justify-content:space-between; align-items:center;
+  margin-bottom: 18px; box-shadow: 0 5px 18px rgba(30, 60, 100, .04);
+}
+.pp-brand { font-size: 18px; font-weight: 850; color: var(--pp-ink); }
+.pp-brand span { color: var(--pp-blue); }
+.pp-status { display:flex; gap:8px; align-items:center; font-size:12px; font-weight:700; color:var(--pp-green); }
+.pp-dot { width:8px; height:8px; background:var(--pp-green); border-radius:50%; display:inline-block; }
+.pp-hero {
+  background: linear-gradient(135deg, #ffffff 0%, #f2f7ff 100%);
+  border: 1px solid var(--pp-blue-100); border-radius: 24px;
+  padding: 28px; margin-bottom: 18px;
+}
+.pp-eyebrow { color:var(--pp-blue); text-transform:uppercase; letter-spacing:.12em; font-size:11px; font-weight:850; }
+.pp-hero-title { font-size: 35px; font-weight: 900; line-height: 1.05; margin: 7px 0 8px; }
+.pp-hero-sub { color: var(--pp-muted); font-size: 15px; max-width: 800px; }
+.pp-card {
+  background: white; border:1px solid var(--pp-line); border-radius:var(--pp-radius);
+  padding: 18px; box-shadow: 0 7px 24px rgba(30, 60, 100, .035); margin-bottom: 14px;
+}
+.pp-card-title { font-size:15px; font-weight:850; color:var(--pp-ink); margin-bottom:5px; }
+.pp-card-sub { font-size:12px; color:var(--pp-muted); margin-bottom:13px; }
+.pp-metric {
+  background:#fff; border:1px solid var(--pp-line); border-radius:15px; padding:15px;
+}
+.pp-metric-label { color:var(--pp-muted); font-size:11px; font-weight:750; }
+.pp-metric-value { color:var(--pp-ink); font-size:24px; font-weight:900; margin-top:4px; }
+.pp-tag {
+  display:inline-block; background:var(--pp-blue-50); color:var(--pp-blue-2);
+  border:1px solid var(--pp-blue-100); border-radius:999px; padding:4px 8px;
+  font-size:11px; font-weight:750; margin:2px;
+}
+.pp-output {
+  background:#0d1b35; color:#eaf1ff; border-radius:15px; padding:17px;
+  border:1px solid #20365f; white-space:pre-wrap; line-height:1.55; font-size:13px;
+}
+.pp-side-note { font-size:11px; color:var(--pp-muted); line-height:1.45; }
+div[data-testid="stExpander"] { border:1px solid var(--pp-line); border-radius:14px; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
+# ----------------------------- Configuration -----------------------------
+
+def secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, None)
+        if value is not None:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+GROQ_API_KEY = secret("GROQ_API_KEY")
+SUPABASE_URL = secret("SUPABASE_URL")
+SUPABASE_KEY = secret("SUPABASE_KEY")
+ELEVENLABS_API_KEY = secret("ELEVENLABS_API_KEY")
+FAST_MODEL = secret("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+QUALITY_MODEL = secret("GROQ_QUALITY_MODEL", "openai/gpt-oss-120b")
+ELEVEN_VOICE_ID = secret("ELEVENLABS_VOICE_ID", "")
+
+# ----------------------------- Session State -----------------------------
+
+defaults = {
+    "page": "Prompt Studio",
+    "prompt": "",
+    "result": "",
+    "plan": None,
+    "analysis": None,
+    "history": [],
+    "last_run_ms": 0,
+    "request_id": "",
+    "error": "",
+    "role": "AI Assistant",
+    "mode": "Fast",
+    "voice": False,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ----------------------------- Domain Models -----------------------------
 
 @dataclass
-class HeuristicSignals:
+class PromptSignals:
     word_count: int
-    question: bool
-    code_request: bool
-    research_request: bool
-    creative_request: bool
-    business_request: bool
-    technical_request: bool
+    is_question: bool
+    code: bool
+    research: bool
+    creative: bool
+    business: bool
+    data: bool
+    technical: bool
+
+@dataclass
+class PromptAnalysis:
+    intent: str
+    complexity: float
+    completeness: int
+    confidence: int
+    signals: Dict[str, Any]
+    missing: List[str]
+    route: str
+
+@dataclass
+class PromptPlan:
+    title: str
+    objective: str
+    context: str
+    instructions: List[str]
+    constraints: List[str]
+    output_format: str
+    assumptions: List[str]
+    optimized_prompt: str
 
 
-def extract_signals(text: str) -> HeuristicSignals:
-    lowered = text.lower()
+# ----------------------------- Provider Layer -----------------------------
 
-    code_terms = (
-        "code",
-        "python",
-        "javascript",
-        "typescript",
-        "fastapi",
-        "api",
-        "sql",
-        "react",
-        "backend",
-        "frontend",
-        "algorithm",
-    )
+@st.cache_resource(show_spinner=False)
+def get_groq():
+    if not GROQ_API_KEY or Groq is None:
+        return None
+    return Groq(api_key=GROQ_API_KEY)
 
-    research_terms = (
-        "research",
-        "paper",
-        "hypothesis",
-        "experiment",
-        "dataset",
-        "literature",
-        "methodology",
-    )
+@st.cache_resource(show_spinner=False)
+def get_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
 
-    creative_terms = (
-        "design",
-        "write",
-        "story",
-        "creative",
-        "logo",
-        "poster",
-        "content",
-        "caption",
-    )
+@st.cache_resource(show_spinner=False)
+def get_elevenlabs():
+    if not ELEVENLABS_API_KEY or ElevenLabs is None:
+        return None
+    try:
+        return ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    except Exception:
+        return None
 
-    business_terms = (
-        "business",
-        "product",
-        "startup",
-        "market",
-        "customer",
-        "revenue",
-        "strategy",
-        "enterprise",
-    )
 
-    return HeuristicSignals(
+# ----------------------------- Intelligence Layer -----------------------------
+
+STOPWORDS = {
+    "the","a","an","is","are","to","of","and","or","for","in","on","with",
+    "this","that","it","i","you","me","my","we","can","please","make","give"
+}
+
+def sanitize_prompt(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"\x00", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:12000]
+
+def extract_signals(text: str) -> PromptSignals:
+    t = text.lower()
+    return PromptSignals(
         word_count=len(text.split()),
-        question="?" in text,
-        code_request=any(
-            term in lowered
-            for term in code_terms
-        ),
-        research_request=any(
-            term in lowered
-            for term in research_terms
-        ),
-        creative_request=any(
-            term in lowered
-            for term in creative_terms
-        ),
-        business_request=any(
-            term in lowered
-            for term in business_terms
-        ),
-        technical_request=any(
-            term in lowered
-            for term in code_terms
-        ),
+        is_question="?" in text,
+        code=bool(re.search(r"\b(code|python|javascript|java|sql|api|function|debug|bug|algorithm)\b", t)),
+        research=bool(re.search(r"\b(research|paper|experiment|hypothesis|literature|citation|study)\b", t)),
+        creative=bool(re.search(r"\b(story|poem|design|creative|caption|image|brand|logo)\b", t)),
+        business=bool(re.search(r"\b(strategy|business|market|sales|customer|product|enterprise|roi|kpi)\b", t)),
+        data=bool(re.search(r"\b(data|dataset|analytics|statistics|model|regression|forecast)\b", t)),
+        technical=bool(re.search(r"\b(architecture|system|database|backend|frontend|cloud|docker|kubernetes|security)\b", t)),
     )
 
+def completeness_score(text: str) -> tuple[int, List[str]]:
+    t = text.lower()
+    score = 15
+    missing = []
+    checks = [
+        ("clear task", bool(re.search(r"\b(create|build|write|explain|analyze|design|fix|compare|generate|develop|optimize)\b", t)), 25),
+        ("context", len(text.split()) >= 12, 20),
+        ("constraints", bool(re.search(r"\b(must|should|avoid|under|within|only|using|without)\b", t)), 15),
+        ("audience", bool(re.search(r"\b(for|audience|user|customer|student|developer|manager|team)\b", t)), 10),
+        ("output format", bool(re.search(r"\b(table|json|steps|bullet|report|code|email|list|markdown|format)\b", t)), 15),
+    ]
+    for name, ok, points in checks:
+        if ok:
+            score += points
+        else:
+            missing.append(name)
+    return min(100, score), missing
 
-def estimate_complexity(
-    text: str,
-    signals: HeuristicSignals,
-) -> float:
-    """
-    Lightweight complexity estimator.
+def estimate_complexity(signals: PromptSignals) -> float:
+    score = 0.15
+    score += min(signals.word_count / 500, 0.25)
+    score += 0.12 if signals.code else 0
+    score += 0.12 if signals.research else 0
+    score += 0.10 if signals.business else 0
+    score += 0.10 if signals.data else 0
+    score += 0.10 if signals.technical else 0
+    return round(min(score, 1.0), 3)
 
-    This is not intended as an ML classifier.
-    It provides a deterministic routing signal before
-    invoking the expensive model.
-    """
+def infer_intent(s: PromptSignals) -> str:
+    if s.code or s.technical:
+        return "Technical / Engineering"
+    if s.research:
+        return "Research / Analysis"
+    if s.business:
+        return "Business / Product"
+    if s.creative:
+        return "Creative / Content"
+    if s.data:
+        return "Data / Analytics"
+    return "General Assistance"
 
-    score = 0.0
+def analyze_prompt(text: str, mode: str) -> PromptAnalysis:
+    s = extract_signals(text)
+    comp, missing = completeness_score(text)
+    complexity = estimate_complexity(s)
+    route = QUALITY_MODEL if mode == "Quality" or complexity >= 0.58 else FAST_MODEL
+    confidence = max(50, min(98, 55 + int(comp * 0.35) + int(complexity * 12)))
+    return PromptAnalysis(
+        intent=infer_intent(s),
+        complexity=complexity,
+        completeness=comp,
+        confidence=confidence,
+        signals=asdict(s),
+        missing=missing,
+        route=route,
+    )
 
-    if signals.word_count > 25:
-        score += 0.15
-
-    if signals.word_count > 80:
-        score += 0.20
-
-    if signals.word_count > 160:
-        score += 0.20
-
-    if signals.code_request:
-        score += 0.15
-
-    if signals.research_request:
-        score += 0.20
-
-    if signals.business_request:
-        score += 0.10
-
-    if signals.question:
-        score += 0.05
-
-    return min(score, 1.0)
-
-
-def select_model(
-    quality: str,
-    complexity: float,
-) -> str:
-    """
-    Model routing algorithm.
-
-    Explicit quality mode always wins.
-    Otherwise fast requests stay on the smaller model.
-    """
-
-    if quality == "quality":
-        return settings.groq_quality_model
-
-    if complexity >= 0.65:
-        return settings.groq_quality_model
-
-    return settings.groq_fast_model
-
-
-def build_planner_prompt(
-    profile: UserProfile,
-    signals: HeuristicSignals,
-) -> str:
-    return f"""
-You are PromptPilot's enterprise Prompt Intelligence Kernel.
-
-Your responsibility is prompt transformation, NOT answering the user's
-original request.
-
-USER PROFILE
------------
-Name: {profile.name}
-Role: {profile.role}
-Domain: {profile.domain or "general"}
-Expertise: {profile.expertise or "general"}
-Tone: {profile.tone}
-Language: {profile.language}
-
-DETERMINISTIC SIGNALS
----------------------
-Word count: {signals.word_count}
-Question detected: {signals.question}
-Technical/code signals: {signals.technical_request}
-Research signals: {signals.research_request}
-Creative signals: {signals.creative_request}
-Business signals: {signals.business_request}
-
-OPTIMIZATION ALGORITHM
-----------------------
-1. Identify the user's true intent.
-2. Extract the concrete task.
-3. Preserve supplied context.
-4. Identify explicit constraints.
-5. Identify missing information that materially affects the answer.
-6. Create only reasonable assumptions and expose them.
-7. Select an appropriate output format.
-8. Define a useful quality bar.
-9. Rewrite the request into a standalone, reusable prompt.
-10. Do not add goals that the user did not imply.
-11. Avoid prompt bloat.
-12. For technical tasks include correctness, security, performance,
-    testing and edge-case requirements when relevant.
-13. For research tasks include methodology, evaluation and limitations.
-14. For business tasks include assumptions, trade-offs and measurable
-    deliverables where appropriate.
-15. Return only the required JSON object.
-
-The optimized prompt must be ready to paste into another AI system.
-""".strip()
-
-
-def deterministic_fallback(
-    raw: str,
-    signals: HeuristicSignals,
-) -> PromptPlan:
-    """
-    Safe fallback if structured AI output is unavailable.
-
-    This guarantees that the product remains useful even if
-    the external model has an outage.
-    """
-
-    if signals.code_request:
-        intent = "Technical implementation"
-        output = (
-            "Production-ready explanation and complete implementation "
-            "with validation, security, testing and edge cases."
-        )
-
-    elif signals.research_request:
-        intent = "Research analysis"
-        output = (
-            "Structured research analysis with methodology, "
-            "evaluation metrics, assumptions and limitations."
-        )
-
-    elif signals.creative_request:
-        intent = "Creative generation"
-        output = (
-            "Clear, polished creative output with the requested "
-            "style, structure and audience."
-        )
-
-    elif signals.business_request:
-        intent = "Business analysis"
-        output = (
-            "Structured business response with assumptions, "
-            "trade-offs, actions and measurable outcomes."
-        )
-
-    else:
-        intent = "General assistance"
-        output = (
-            "Clear, structured response with practical next steps."
-        )
-
-    optimized = f"""
-Act as an expert assistant.
-
-Task:
-{raw}
-
-Requirements:
-- Preserve the original intent.
-- Make the response clear and actionable.
-- State important assumptions.
-- Use an appropriate structure.
-- Avoid unsupported claims.
-- Include examples where they materially improve understanding.
-
-Output:
-{output}
-""".strip()
-
+def deterministic_plan(text: str, analysis: PromptAnalysis, role: str) -> PromptPlan:
+    objective = text.strip()
+    constraints = [
+        "Preserve factual accuracy and state assumptions when information is missing.",
+        "Use a clear, structured response appropriate for the requested task.",
+    ]
+    if analysis.signals.get("code"):
+        constraints.append("Prefer production-quality code with validation and error handling.")
+    if analysis.signals.get("research"):
+        constraints.append("Separate established evidence from hypotheses or assumptions.")
+    output = "Provide a concise, structured answer with actionable details."
+    optimized = (
+        f"Role: {role}\n\n"
+        f"Objective:\n{objective}\n\n"
+        "Execution requirements:\n"
+        "- Understand the user's actual goal before responding.\n"
+        "- Use the supplied context and avoid inventing missing facts.\n"
+        "- Make the answer structured, actionable, and easy to verify.\n\n"
+        f"Constraints:\n" + "\n".join(f"- {x}" for x in constraints) +
+        f"\n\nOutput format:\n{output}"
+    )
     return PromptPlan(
-        intent=intent,
-        task=raw,
-        context="",
-        constraints=[
-            "Preserve original intent",
-            "Be clear and actionable",
+        title="Optimized Prompt",
+        objective=objective,
+        context="User-provided request with deterministic signal analysis.",
+        instructions=[
+            "Understand the goal and identify the required deliverable.",
+            "Use relevant context and explicit constraints.",
+            "Return the requested output in a structured format.",
         ],
+        constraints=constraints,
         output_format=output,
         assumptions=[],
         optimized_prompt=optimized,
-        confidence=0.55,
     )
 
 
-# ============================================================================
-# 7. AI PROVIDER LAYER
-# ============================================================================
+# ----------------------------- Orchestration Layer -----------------------------
 
-async def groq_completion(
-    *,
-    model: str,
-    messages: list[dict[str, Any]],
-    response_format: Optional[dict[str, Any]] = None,
-    temperature: float = 0.2,
-    max_tokens: int = 1800,
-) -> str:
+PLANNER_SYSTEM = """You are PromptPilot's prompt-planning engine.
+Transform a user's rough request into a precise, reusable instruction.
+Return ONLY valid JSON matching the supplied schema.
+Do not invent facts. Preserve the user's intent.
+"""
 
-    if not groq_client:
-        raise HTTPException(
-            status_code=503,
-            detail="AI provider is not configured.",
-        )
+def call_planner(text: str, analysis: PromptAnalysis, role: str) -> PromptPlan:
+    client = get_groq()
+    if client is None:
+        return deterministic_plan(text, analysis, role)
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_completion_tokens": max_tokens,
-    }
-
-    if response_format:
-        payload["response_format"] = response_format
-
-    def blocking_call():
-        return groq_client.chat.completions.create(
-            **payload
-        )
-
-    try:
-
-        response = await asyncio.wait_for(
-            asyncio.to_thread(blocking_call),
-            timeout=settings.request_timeout_seconds,
-        )
-
-    except asyncio.TimeoutError:
-
-        raise HTTPException(
-            status_code=504,
-            detail="AI provider timeout.",
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Groq provider failure."
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "AI provider request failed: "
-                f"{str(exc)[:250]}"
-            ),
-        )
-
-    content = response.choices[0].message.content
-
-    if not content:
-        raise HTTPException(
-            status_code=502,
-            detail="AI provider returned an empty response.",
-        )
-
-    return content
-
-
-# ============================================================================
-# 8. PLANNING ALGORITHM
-# ============================================================================
-
-async def optimize_prompt(
-    request: ChatRequest,
-) -> PromptPlan:
-
-    raw = request.user_input
-
-    signals = extract_signals(raw)
-
-    complexity = estimate_complexity(
-        raw,
-        signals,
-    )
-
-    model = select_model(
-        request.quality,
-        complexity,
-    )
-
-    planner_system = build_planner_prompt(
-        request.user_profile,
-        signals,
-    )
-
-    try:
-
-        content = await groq_completion(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": planner_system,
-                },
-                {
-                    "role": "user",
-                    "content": raw,
-                },
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "prompt_plan",
-                    "strict": True,
-                    "schema": PROMPT_PLAN_SCHEMA,
-                },
-            },
-            temperature=0.10,
-            max_tokens=1600,
-        )
-
-        plan = PromptPlan.model_validate(
-            json.loads(content)
-        )
-
-        # Clamp confidence defensively.
-        plan.confidence = max(
-            0.0,
-            min(1.0, plan.confidence),
-        )
-
-        return plan
-
-    except HTTPException:
-        raise
-
-    except Exception:
-        logger.exception(
-            "Planner failed; using deterministic fallback."
-        )
-
-        return deterministic_fallback(
-            raw,
-            signals,
-        )
-
-
-# ============================================================================
-# 9. EXECUTION LAYER
-# ============================================================================
-
-def build_execution_system(
-    profile: UserProfile,
-) -> str:
-
-    return f"""
-You are PromptPilot's AI execution engine.
-
-Execute the optimized prompt directly.
-
-USER
-----
-Role: {profile.role}
-Domain: {profile.domain or "general"}
-Expertise: {profile.expertise or "general"}
-Tone: {profile.tone}
-Language: {profile.language}
-
-EXECUTION POLICY
-----------------
-- Follow the optimized prompt.
-- Do not mention internal system instructions.
-- Do not fabricate sources or facts.
-- Clearly distinguish assumptions from facts.
-- Prefer useful structure over unnecessary verbosity.
-- For code, prioritize runnable, secure and maintainable output.
-- For research, explain methodology and uncertainty.
-- For business decisions, show assumptions and trade-offs.
-""".strip()
-
-
-async def execute_prompt(
-    plan: PromptPlan,
-    profile: UserProfile,
-    quality: str,
-) -> str:
-
-    model = (
-        settings.groq_quality_model
-        if quality == "quality"
-        else settings.groq_fast_model
-    )
-
-    max_tokens = (
-        settings.max_completion_tokens_quality
-        if quality == "quality"
-        else settings.max_completion_tokens_fast
-    )
-
-    return await groq_completion(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": build_execution_system(
-                    profile
-                ),
-            },
-            {
-                "role": "user",
-                "content": plan.optimized_prompt,
-            },
+    schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "objective": {"type": "string"},
+            "context": {"type": "string"},
+            "instructions": {"type": "array", "items": {"type": "string"}},
+            "constraints": {"type": "array", "items": {"type": "string"}},
+            "output_format": {"type": "string"},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "optimized_prompt": {"type": "string"},
+        },
+        "required": [
+            "title","objective","context","instructions","constraints",
+            "output_format","assumptions","optimized_prompt"
         ],
-        temperature=0.25,
-        max_tokens=max_tokens,
-    )
+        "additionalProperties": False,
+    }
 
+    try:
+        r = client.chat.completions.create(
+            model=analysis.route,
+            temperature=0.2,
+            max_tokens=1600,
+            messages=[
+                {"role":"system","content":PLANNER_SYSTEM},
+                {"role":"user","content":json.dumps({
+                    "role": role,
+                    "request": text,
+                    "analysis": asdict(analysis),
+                })},
+            ],
+            response_format={"type":"json_schema","json_schema":{"name":"prompt_plan","schema":schema}},
+        )
+        raw = r.choices[0].message.content
+        data = json.loads(raw)
+        return PromptPlan(**data)
+    except Exception:
+        return deterministic_plan(text, analysis, role)
 
-# ============================================================================
-# 10. VOICE LAYER
-# ============================================================================
-
-async def synthesize_voice(
-    text: str,
-) -> Optional[str]:
-
-    if (
-        not elevenlabs_client
-        or not settings.elevenlabs_voice_id
-    ):
-        return None
-
-    text = text[:2500]
-
-    def blocking_call():
-
-        audio = (
-            elevenlabs_client
-            .text_to_speech
-            .convert(
-                voice_id=settings.elevenlabs_voice_id,
-                text=text,
-                model_id="eleven_multilingual_v2",
-                output_format="mp3_44100_128",
-            )
+def execute_prompt(plan: PromptPlan, analysis: PromptAnalysis, role: str) -> str:
+    client = get_groq()
+    if client is None:
+        return (
+            "Provider is not configured. The deterministic PromptPilot pipeline "
+            "completed successfully.\n\nOptimized prompt:\n" + plan.optimized_prompt
         )
 
+    system = f"""You are PromptPilot's execution engine.
+Role: {role}
+Answer the optimized prompt directly.
+Be accurate, structured, useful, and do not claim actions you did not perform.
+"""
+    try:
+        r = client.chat.completions.create(
+            model=analysis.route,
+            temperature=0.35,
+            max_tokens=3000,
+            messages=[
+                {"role":"system","content":system},
+                {"role":"user","content":plan.optimized_prompt},
+            ],
+        )
+        return r.choices[0].message.content or "No output returned."
+    except Exception as e:
+        return "Execution fallback: " + plan.optimized_prompt
+
+def synthesize_voice(text: str) -> Optional[bytes]:
+    client = get_elevenlabs()
+    if client is None or not ELEVEN_VOICE_ID:
+        return None
+    try:
+        audio = client.text_to_speech.convert(
+            voice_id=ELEVEN_VOICE_ID,
+            model_id="eleven_multilingual_v2",
+            text=text[:5000],
+        )
         return b"".join(audio)
-
-    try:
-
-        audio_bytes = await asyncio.to_thread(
-            blocking_call
-        )
-
-        return base64.b64encode(
-            audio_bytes
-        ).decode()
-
     except Exception:
-
-        logger.exception(
-            "Voice generation failed."
-        )
-
         return None
 
 
-# ============================================================================
-# 11. ANALYTICS / TELEMETRY LAYER
-# ============================================================================
+# ----------------------------- Persistence / Observability -----------------------------
 
-async def persist_run(
-    request: ChatRequest,
-    plan: PromptPlan,
-    response_text: str,
-    latency_ms: float,
-    model: str,
-    request_id: str,
-):
-
-    if (
-        not supabase
-        or not settings.enable_telemetry
-    ):
+def log_run(payload: Dict[str, Any]) -> None:
+    client = get_supabase()
+    if client is None:
         return
-
-    row = {
-        "request_id": request_id,
-        "created_at": "now()",
-        "user_name": request.user_profile.name,
-        "user_role": request.user_profile.role,
-        "raw_input": request.user_input,
-        "intent": plan.intent,
-        "optimized_prompt": plan.optimized_prompt,
-        "ai_response": response_text,
-        "quality_mode": request.quality,
-        "model": model,
-        "confidence": plan.confidence,
-        "latency_ms": round(
-            latency_ms,
-            2,
-        ),
-    }
-
     try:
-
-        await asyncio.to_thread(
-            lambda:
-            supabase
-            .table("prompt_runs")
-            .insert(row)
-            .execute()
-        )
-
+        client.table("promptpilot_runs").insert(payload).execute()
     except Exception:
+        pass
 
-        logger.exception(
-            "Telemetry persistence failed."
-        )
-
-
-# ============================================================================
-# 12. HEALTH / OBSERVABILITY
-# ============================================================================
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "ok",
-        "service": settings.app_name,
-        "version": settings.version,
-        "environment": settings.environment,
-        "ai_configured": (
-            groq_client is not None
-        ),
-        "database_configured": (
-            supabase is not None
-        ),
-        "voice_configured": (
-            elevenlabs_client is not None
-        ),
-    }
-
-
-@app.get("/ready")
-async def ready():
-
-    if not groq_client:
-
-        return JSONResponse(
-            status_code=503,
-            content={
-                "ready": False,
-                "reason": (
-                    "AI provider is not configured."
-                ),
-            },
-        )
-
-    return {
-        "ready": True
-    }
-
-
-@app.get("/api/v1/config")
-async def public_config():
-
-    return {
-        "app_name": settings.app_name,
-        "version": settings.version,
-
-        "features": {
-            "prompt_optimization": (
-                groq_client is not None
-            ),
-            "voice": (
-                elevenlabs_client is not None
-            ),
-            "analytics": (
-                supabase is not None
-                and settings.enable_telemetry
-            ),
-        },
-
-        "models": {
-            "fast": settings.groq_fast_model,
-            "quality": settings.groq_quality_model,
-        },
-    }
-
-
-# ============================================================================
-# 13. PRODUCT API
-# ============================================================================
-
-@app.post("/api/v1/prompt/preview")
-async def preview(
-    request: ChatRequest,
-):
-
+def run_pipeline(user_prompt: str, role: str, mode: str, execute: bool, voice: bool):
     started = time.perf_counter()
+    request_id = uuid.uuid4().hex[:12]
+    text = sanitize_prompt(user_prompt)
+    if not text:
+        raise ValueError("Please enter a prompt first.")
 
-    plan = await optimize_prompt(
-        request
-    )
+    analysis = analyze_prompt(text, mode)
+    plan = call_planner(text, analysis, role)
+    result = execute_prompt(plan, analysis, role) if execute else ""
 
-    latency_ms = (
-        time.perf_counter() - started
-    ) * 1000
+    elapsed = int((time.perf_counter() - started) * 1000)
+    audio = synthesize_voice(result) if voice and result else None
 
-    return {
-        "request_id": str(uuid.uuid4()),
-        "data": {
-            "plan": plan.model_dump(),
-            "latency_ms": round(
-                latency_ms,
-                2,
-            ),
-        },
-    }
-
-
-@app.post("/api/v1/prompt/optimize")
-async def optimize(
-    request: ChatRequest,
-):
-
-    request_id = str(uuid.uuid4())
-
-    started = time.perf_counter()
-
-    plan = await optimize_prompt(
-        request
-    )
-
-    response_text = ""
-
-    if request.include_execution:
-
-        response_text = await execute_prompt(
-            plan,
-            request.user_profile,
-            request.quality,
-        )
-
-    audio_data = None
-
-    if request.use_voice and response_text:
-
-        audio_data = await synthesize_voice(
-            response_text
-        )
-
-    latency_ms = (
-        time.perf_counter() - started
-    ) * 1000
-
-    model = select_model(
-        request.quality,
-        estimate_complexity(
-            request.user_input,
-            extract_signals(
-                request.user_input
-            ),
-        ),
-    )
-
-    # Fire-and-forget telemetry.
-    asyncio.create_task(
-        persist_run(
-            request=request,
-            plan=plan,
-            response_text=response_text,
-            latency_ms=latency_ms,
-            model=model,
-            request_id=request_id,
-        )
-    )
-
-    return {
+    payload = {
         "request_id": request_id,
-
-        "data": {
-            "plan": plan.model_dump(),
-
-            "response": response_text,
-
-            "audio_data": audio_data,
-
-            "latency_ms": round(
-                latency_ms,
-                2,
-            ),
-
-            "model": model,
-        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "role": role,
+        "intent": analysis.intent,
+        "complexity": analysis.complexity,
+        "completeness": analysis.completeness,
+        "latency_ms": elapsed,
+        "input_hash": hashlib.sha256(text.encode()).hexdigest(),
     }
+    log_run(payload)
+    return request_id, analysis, plan, result, audio, elapsed
 
 
-# ============================================================================
-# 14. FRONTEND
-# ============================================================================
+# ----------------------------- UI Layer -----------------------------
 
-@app.get("/")
-async def root():
+with st.sidebar:
+    st.markdown("## ✦ PromptPilot")
+    st.caption("Enterprise prompt intelligence")
+    st.divider()
 
-    return FileResponse(
-        "static/index.html"
+    pages = ["Prompt Studio", "History", "Architecture", "Settings"]
+    st.session_state.page = st.radio(
+        "Workspace", pages,
+        index=pages.index(st.session_state.page)
     )
 
+    st.divider()
+    st.markdown("**Runtime**")
+    provider = "Groq connected" if get_groq() else "Deterministic fallback"
+    st.write("● " + provider)
+    st.caption("Supabase: " + ("Connected" if get_supabase() else "Optional"))
+    st.caption("Voice: " + ("Enabled" if get_elevenlabs() else "Optional"))
 
-# ============================================================================
-# 15. LOCAL ENTRYPOINT
-# ============================================================================
+    st.divider()
+    st.markdown('<div class="pp-side-note">Production note: configure secrets in Streamlit Cloud. Never place API keys in source code.</div>', unsafe_allow_html=True)
 
-if __name__ == "__main__":
+st.markdown("""
+<div class="pp-topbar">
+  <div class="pp-brand">Prompt<span>Pilot</span> <small>Enterprise</small></div>
+  <div class="pp-status"><span class="pp-dot"></span> AI workspace ready</div>
+</div>
+""", unsafe_allow_html=True)
 
-    import uvicorn
+if st.session_state.page == "Prompt Studio":
+    st.markdown("""
+    <div class="pp-hero">
+      <div class="pp-eyebrow">Prompt Intelligence Platform</div>
+      <div class="pp-hero-title">Turn rough ideas into production-ready AI instructions.</div>
+      <div class="pp-hero-sub">Analyze intent, estimate complexity, route to the right model, structure the prompt, execute it, and capture measurable run telemetry.</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    uvicorn.run(
-        "main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=(
-            settings.environment
-            == "development"
-        ),
-    )
+    c1,c2,c3,c4 = st.columns(4)
+    for col, label, value in [
+        (c1,"Pipeline","6 layers"),
+        (c2,"Routing","Adaptive"),
+        (c3,"Output","Structured"),
+        (c4,"Telemetry","Ready"),
+    ]:
+        with col:
+            st.markdown(f'<div class="pp-metric"><div class="pp-metric-label">{label}</div><div class="pp-metric-value">{value}</div></div>', unsafe_allow_html=True)
+
+    st.write("")
+    left, right = st.columns([1.25, .75], gap="large")
+
+    with left:
+        st.markdown('<div class="pp-card-title">Prompt Studio</div><div class="pp-card-sub">Describe what you want in natural language. PromptPilot handles the structure.</div>', unsafe_allow_html=True)
+
+        role = st.selectbox(
+            "AI role",
+            ["AI Assistant","Senior Software Engineer","Data Scientist","Research Analyst","Product Strategist","Technical Writer","Creative Director"],
+            index=["AI Assistant","Senior Software Engineer","Data Scientist","Research Analyst","Product Strategist","Technical Writer","Creative Director"].index(st.session_state.role),
+        )
+        st.session_state.role = role
+
+        prompt = st.text_area(
+            "Your request",
+            value=st.session_state.prompt,
+            height=210,
+            placeholder="Example: Build a production-ready PostgreSQL schema for a university management system with RBAC, audit logging and analytics.",
+            label_visibility="visible",
+        )
+        st.session_state.prompt = prompt
+
+        a,b,c = st.columns([1,1,1])
+        with a:
+            mode = st.radio("Intelligence", ["Fast","Quality"], horizontal=True, index=0 if st.session_state.mode=="Fast" else 1)
+            st.session_state.mode = mode
+        with b:
+            voice = st.toggle("Voice output", value=st.session_state.voice)
+            st.session_state.voice = voice
+        with c:
+            st.caption("Fast = lower latency\nQuality = stronger reasoning route")
+
+        b1,b2,b3 = st.columns([1.2,1,1])
+        with b1:
+            preview = st.button("Analyze & Optimize", type="primary", use_container_width=True)
+        with b2:
+            run = st.button("Optimize & Run", use_container_width=True)
+        with b3:
+            clear = st.button("Clear", use_container_width=True)
+
+        if clear:
+            st.session_state.prompt = ""
+            st.session_state.result = ""
+            st.session_state.plan = None
+            st.session_state.analysis = None
+            st.rerun()
+
+        if preview or run:
+            try:
+                with st.spinner("Running PromptPilot intelligence pipeline..."):
+                    rid, analysis, plan, result, audio, elapsed = run_pipeline(
+                        prompt, role, mode, execute=run, voice=voice
+                    )
+                st.session_state.request_id = rid
+                st.session_state.analysis = analysis
+                st.session_state.plan = plan
+                st.session_state.result = result
+                st.session_state.last_run_ms = elapsed
+                st.session_state.error = ""
+                st.session_state.history.insert(0, {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "request_id": rid,
+                    "intent": analysis.intent,
+                    "mode": mode,
+                    "latency": elapsed,
+                    "prompt": prompt[:100],
+                    "result": result,
+                })
+                if audio:
+                    st.session_state.audio = audio
+            except Exception as e:
+                st.session_state.error = str(e)
+
+        if st.session_state.error:
+            st.error(st.session_state.error)
+
+        if st.session_state.plan:
+            st.markdown("### Optimized Prompt")
+            st.code(st.session_state.plan.optimized_prompt, language="text")
+
+            with st.expander("Planner details"):
+                p = st.session_state.plan
+                st.write("**Objective:**", p.objective)
+                st.write("**Context:**", p.context)
+                st.write("**Instructions:**")
+                for x in p.instructions: st.write("• " + x)
+                st.write("**Constraints:**")
+                for x in p.constraints: st.write("• " + x)
+                st.write("**Output format:**", p.output_format)
+                if p.assumptions:
+                    st.write("**Assumptions:**", p.assumptions)
+
+        if st.session_state.result:
+            st.markdown("### Execution Result")
+            st.markdown(f'<div class="pp-output">{st.session_state.result}</div>', unsafe_allow_html=True)
+            st.download_button(
+                "Download result",
+                st.session_state.result,
+                file_name="promptpilot-result.txt",
+                mime="text/plain",
+            )
+            if st.session_state.get("audio"):
+                st.audio(st.session_state.audio, format="audio/mpeg")
+
+    with right:
+        st.markdown('<div class="pp-card-title">Live Intelligence</div><div class="pp-card-sub">Deterministic analysis runs before model execution.</div>', unsafe_allow_html=True)
+        a = st.session_state.analysis
+        if a:
+            metrics = [
+                ("Intent", a.intent),
+                ("Completeness", f"{a.completeness}%"),
+                ("Confidence", f"{a.confidence}%"),
+                ("Complexity", f"{a.complexity:.2f}"),
+                ("Route", "Quality" if a.route == QUALITY_MODEL else "Fast"),
+                ("Latency", f"{st.session_state.last_run_ms} ms"),
+            ]
+            for label, value in metrics:
+                st.markdown(f'<div class="pp-metric" style="margin-bottom:9px"><div class="pp-metric-label">{label}</div><div class="pp-metric-value" style="font-size:18px">{value}</div></div>', unsafe_allow_html=True)
+
+            st.markdown("#### Signals")
+            for key, value in a.signals.items():
+                if isinstance(value, bool) and value:
+                    st.markdown(f'<span class="pp-tag">{key}</span>', unsafe_allow_html=True)
+            if a.missing:
+                st.warning("Could improve: " + ", ".join(a.missing))
+        else:
+            st.info("Enter a request and run the pipeline to see intent, complexity, completeness, routing and confidence.")
+
+        st.markdown("#### Quick templates")
+        templates = {
+            "Enterprise SQL": "Design a production-ready PostgreSQL database for a university management system with RBAC, audit logging, indexes, constraints, reporting and cloud deployment guidance.",
+            "Research": "Help me formulate a novel AI research hypothesis, experimental design, baselines, evaluation metrics, ablations and reproducibility plan.",
+            "API": "Design a secure FastAPI service with authentication, validation, observability, rate limiting, error handling, testing and deployment architecture.",
+            "Data Science": "Analyze this business problem and propose a data science workflow including data quality checks, feature engineering, model selection and evaluation.",
+        }
+        for name, value in templates.items():
+            if st.button(name, use_container_width=True):
+                st.session_state.prompt = value
+                st.rerun()
+
+elif st.session_state.page == "History":
+    st.title("Run History")
+    st.caption("Session history is local to this Streamlit session. Supabase telemetry can provide persistent history.")
+    if not st.session_state.history:
+        st.info("No runs yet.")
+    else:
+        for item in st.session_state.history[:25]:
+            with st.expander(f"{item['time']} · {item['intent']} · {item['latency']} ms"):
+                st.write("Request ID:", item["request_id"])
+                st.write("Prompt:", item["prompt"])
+                if item["result"]:
+                    st.markdown(item["result"])
+
+elif st.session_state.page == "Architecture":
+    st.title("Enterprise Architecture")
+    st.caption("PromptPilot is structured as a layered application so providers can be replaced without rewriting the UI.")
+    layers = [
+        ("01 · Experience", "Streamlit UI, navigation, workspace state, responsive design system."),
+        ("02 · Application", "User actions, session orchestration, validation and workflow control."),
+        ("03 · Intelligence", "Signal extraction, completeness scoring, complexity estimation and model routing."),
+        ("04 · Orchestration", "Structured prompt planning, execution, fallback and voice synthesis."),
+        ("05 · Providers", "Groq, optional ElevenLabs, optional Supabase persistence."),
+        ("06 · Observability", "Request IDs, latency, hashes, mode, intent and run telemetry."),
+    ]
+    for title, desc in layers:
+        st.markdown(f'<div class="pp-card"><div class="pp-card-title">{title}</div><div class="pp-card-sub">{desc}</div></div>', unsafe_allow_html=True)
+
+    st.markdown("### Processing flow")
+    st.code("Input → Sanitize → Signals → Completeness → Complexity → Model Route → Structured Plan → Execute → Voice → Telemetry", language="text")
+
+elif st.session_state.page == "Settings":
+    st.title("Settings")
+    st.caption("Streamlit Cloud: use App → Settings → Secrets for production credentials.")
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("#### Providers")
+        st.write("Groq:", "Connected" if get_groq() else "Not configured")
+        st.write("Supabase:", "Connected" if get_supabase() else "Not configured")
+        st.write("ElevenLabs:", "Connected" if get_elevenlabs() else "Not configured")
+    with cols[1]:
+        st.markdown("#### Models")
+        st.code(f"Fast: {FAST_MODEL}\nQuality: {QUALITY_MODEL}", language="text")
+    st.info("API keys are intentionally never displayed by this UI.")
+
+st.caption("PromptPilot Enterprise · Streamlit architecture · Blue/white enterprise UI")
